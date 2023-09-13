@@ -1,78 +1,113 @@
-import json
 import os
+import tempfile
+from pathlib import Path
 
-import requests
-from flask import Flask, request
-from flask_api import status
+from flask import Flask, jsonify, request
+from PIL import Image, UnidentifiedImageError
+from werkzeug.exceptions import RequestEntityTooLarge
+from werkzeug.utils import secure_filename
 
-from flask_restful import Api, Resource
-from custom_flask_api import CustomFlaskApi
-from crawler import Crawler
-from classifier import Classifier
-import tqdm
-
-
-flask_app = Flask(__name__)
-api = CustomFlaskApi(flask_app)
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
 
 
-class StatusAPIView(Resource):
-    def get(self):
-        message = "API is up and running"
-        return {"status": message}, status.HTTP_200_OK
+def validate_image(path):
+    with Image.open(path) as image:
+        if image.format not in {'JPEG', 'PNG'}:
+            raise ValueError('Use a PNG or JPEG image')
+        if image.width * image.height > 20_000_000:
+            raise ValueError('Image exceeds the pixel limit')
+        image.verify()
 
 
-class KeywordAPIView(Resource):
-    def get(self):
-        keyword = request.args.get("keyword", None)
+def create_app(classifier=None):
+    application = Flask(__name__)
+    application.config['MAX_CONTENT_LENGTH'] = MAX_IMAGE_BYTES + 64 * 1024
+    application.config['CLASSIFIER_ENABLED'] = os.getenv('ENABLE_PRETRAINED_MODEL') == 'true'
+    application.config['LEGACY_CRAWLER_ENABLED'] = os.getenv('ENABLE_LEGACY_CRAWLER') == 'true'
 
-        if not keyword:
-            return {
-                "message": "Please provide a keyword argument in query params"
-            }, status.HTTP_400_BAD_REQUEST
+    def classify(path, filename):
+        predictor = classifier
+        if predictor is None:
+            if not application.config['CLASSIFIER_ENABLED']:
+                raise RuntimeError('Classifier is not enabled')
+            from classifier import Classifier
+            predictor = Classifier.classify_file
+        result = predictor(path)
+        return {'filename': filename, 'label': result['label'], 'probability': result['probability']}
 
-        crawler = Crawler()
-        image_links = crawler.get_image_links(keyword)
-        self.download_images(image_links)
+    @application.get('/status')
+    def status():
+        return jsonify(status='API is up and running', classifier_enabled=application.config['CLASSIFIER_ENABLED'], legacy_crawler_enabled=application.config['LEGACY_CRAWLER_ENABLED'])
 
-        predictions = Classifier.classify_image()
-        return {"predictions": predictions}, status.HTTP_200_OK
+    @application.errorhandler(RequestEntityTooLarge)
+    def too_large(_error):
+        return jsonify(message='Image must be no larger than 5 MiB'), 413
 
-    def download_images(self, image_links):
-        for link in image_links:
-            print("Downloading {}".format(link))
-            response = requests.get(link, allow_redirects=True)
+    @application.post('/file')
+    def upload():
+        image = request.files.get('image')
+        if image is None or not image.filename or len(request.files) != 1 or len(request.files.getlist('image')) != 1:
+            return jsonify(message="Provide one image using the 'image' field"), 400
+        try:
+            with tempfile.TemporaryDirectory(prefix='tweet-image-') as directory:
+                path = Path(directory) / 'upload-image'
+                image.save(path)
+                if path.stat().st_size > MAX_IMAGE_BYTES:
+                    raise RequestEntityTooLarge()
+                validate_image(path)
+                result = classify(path, secure_filename(image.filename) or 'upload-image')
+                return jsonify(predictions=[result])
+        except RequestEntityTooLarge:
+            raise
+        except (UnidentifiedImageError, ValueError, OSError):
+            return jsonify(message='Provide a valid PNG/JPEG image within the size and pixel limits'), 400
+        except (ImportError, RuntimeError):
+            return jsonify(message='Image classifier is not enabled or available on this server'), 503
+        except Exception:
+            return jsonify(message='Image classification failed'), 500
 
-            if not os.path.exists("images"):
-                os.mkdir("images")
+    @application.get('/keyword')
+    def keyword():
+        if not application.config['LEGACY_CRAWLER_ENABLED'] or not application.config['CLASSIFIER_ENABLED']:
+            return jsonify(message='Legacy profile-image crawling is disabled on this server'), 503
+        handle = request.args.get('keyword', '')
+        import re
+        if not re.fullmatch(r'[A-Za-z0-9_]{1,32}', handle):
+            return jsonify(message='Provide a simple profile handle'), 400
+        try:
+            from crawler import Crawler, is_allowed_media_url
+            import requests
+            crawler = Crawler()
+            try:
+                links = crawler.get_image_links(handle)
+            finally:
+                crawler.close()
+            predictions = []
+            with tempfile.TemporaryDirectory(prefix='tweet-crawl-') as directory:
+                for index, link in enumerate(links[:5]):
+                    if not is_allowed_media_url(link):
+                        continue
+                    path = Path(directory) / f'image-{index}'
+                    with requests.get(link, stream=True, allow_redirects=False, timeout=(3, 10)) as response:
+                        if response.status_code != 200:
+                            raise ValueError('Media request failed')
+                        total = 0
+                        with path.open('wb') as output:
+                            for chunk in response.iter_content(32 * 1024):
+                                total += len(chunk)
+                                if total > MAX_IMAGE_BYTES:
+                                    raise ValueError('Media exceeds limit')
+                                output.write(chunk)
+                    validate_image(path)
+                    predictions.append(classify(path, f'image-{index}'))
+            return jsonify(predictions=predictions)
+        except Exception:
+            return jsonify(message='Legacy profile-image collection failed'), 502
 
-            if link.find("/"):
-                filename = link.rsplit("/", 1)[1]
-            block_size = 1024  # One 1kb
-            with open(f"images/{filename}.jpg", "wb") as f:
-                for data in response.iter_content(block_size):
-                    f.write(data)
+    return application
 
 
-class FileAPIView(Resource):
-    def post(self):
-        request_data = request.files
-        image = request_data.get("image", None)
+flask_app = create_app()
 
-        if not image:
-            return {
-                "message": "Please provide image with 'image' key in request"
-            }, status.HTTP_400_BAD_REQUEST
-
-        Classifier.save_image(image.filename, image)
-        predictions = Classifier.classify_image()
-
-        return {"predictions": predictions}, status.HTTP_200_OK
-
-
-api.add_resource(StatusAPIView, "/status")
-api.add_resource(KeywordAPIView, "/keyword")
-api.add_resource(FileAPIView, "/file")
-
-if __name__ == "__main__":
-    flask_app.run()
+if __name__ == '__main__':
+    flask_app.run(host='127.0.0.1')
